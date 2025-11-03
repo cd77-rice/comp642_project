@@ -22,13 +22,20 @@ class Backdrop:
     height: float = 2.5
 
 
+@dataclass(frozen=True)
+class Subject:
+    file: pathlib.Path
+    height: float
+    type_: str
+
+
+@dataclass(frozen=True)
+class SubjectGroup:
+    subject_type: str
+    count: int
+
+
 class Overlay:
-
-    @dataclass(frozen=True)
-    class SubjectGroup:
-        subject_type: str
-        count: int
-
     bound_box = Point(360, 20), Point(500, 270)
     front_factor = 1.0
     back_factor = 0.35
@@ -38,13 +45,6 @@ class Overlay:
     ]
 
     output_image_size = (900, 600)
-
-
-@dataclass(frozen=True)
-class Subject:
-    file: pathlib.Path
-    height: float
-    type_: str
 
 
 class Inventory:
