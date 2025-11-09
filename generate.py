@@ -3,9 +3,10 @@ from PIL import ImageFile
 import logging
 import sys
 import random
+import pathlib
 import numpy as np
 
-from config import OUTPUT_DIR
+from config import OUTPUT_DIR, SubjectGroup
 from config import Point
 from config import Backdrop
 from config import Overlay
@@ -17,7 +18,7 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 stdout_stream_handler = logging.StreamHandler(sys.stdout)
 stdout_stream_handler.setFormatter(logging.Formatter(
-    '%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    '%(asctime)s - %(levelname)s - %(message)s'))
 logger.addHandler(stdout_stream_handler)
 
 
@@ -89,23 +90,47 @@ def random_overlay(subject: Subject, backdrop_img: ImageFile.ImageFile,
     factor_base = backdrop_dpm / dpm_subject
 
     point, factor_position = random_point(overlay, background)
-    angle = random.uniform(-1.0, 1.0)
-    if random.random() > 0.5:
+    angle = random.uniform(overlay.angle_min, overlay.angle_max)
+    if random.random() > overlay.flip_probability:
         subject_image = subject_image.transpose(Image.FLIP_LEFT_RIGHT)
 
     return overlay_images(backdrop_img, subject_image, angle, point,
                           factor_base * factor_position)
 
 
-def generate():
+def scale_image(img: Image, overlay: Overlay):
+    """
+    Scale and crop the image and return new image.
+
+    - If image w > h: cut left and right band (centered)
+    - If image w < h | w == h: cut top and bottom band (centered)
+    """
+
+    min_img_dim = min(img.size)
+    if min_img_dim != overlay.output_image_width:
+        scale_factor = overlay.output_image_width / min_img_dim
+        img_mod = img.resize(
+            size=(int(img.size[0] * scale_factor),
+                          int(img.size[1] * scale_factor)))
+    else:
+        img_mod = img.copy()
+
+    if min_img_dim == img.size[1]:
+        dh = int((img_mod.size[0] - overlay.output_image_width) / 2)
+        img_mod = img_mod.crop(box=(dh, 0, dh + overlay.output_image_width, img_mod.size[1]))
+    else:
+        dv = int((img_mod.size[0] - overlay.output_image_width) / 2)
+        img_mod = img_mod.crop(box=(0, dv, img_mod.size[1], dv + overlay.output_image_width))
+
+    return img_mod
+
+
+def generate() -> dict[SubjectGroup, list[pathlib.Path]]:
     """
     Generate pictures with random subjects.
 
     The backdrop is static, subjects are randomly positioned and scaled.
     """
-
-    # TODO: image scaling per Overlay definition
-    # TODO: select 1/3 animals, 2/3 human ... stratified
 
     if not OUTPUT_DIR.exists():
         OUTPUT_DIR.mkdir()
@@ -132,7 +157,9 @@ def generate():
     logger.info(f'>>>> generating {total_images} images')
     start_idx = 0
     overlay = Overlay()
+    image_map: dict[SubjectGroup, list[pathlib.Path]] = {}
     for group in overlay.groups:
+        image_map[group] = []
 
         if group.subject_type not in subjects_by_type:
             err_msg = f'subject type "{group.subject_type}" not in inventory'
@@ -144,6 +171,7 @@ def generate():
         for idx in range(group.count):
             image_number = f'{idx + 1 + start_idx}'.zfill(zfill_width)
             out_file = OUTPUT_DIR / f'{image_number}-{group.subject_type}.png'
+            image_map[group].append(out_file)
 
             subject_count = 1
             if group.subject_type == "human" and random.random() < 0.15:
@@ -158,6 +186,8 @@ def generate():
             overlayed_img = random_overlay(subjects[0], overlayed_img,
                                            backdrop_dpm, overlay)
 
+            overlayed_img = scale_image(overlayed_img, overlay)
+
             overlayed_img.save(out_file)
             logger.info(
                 f'{[subj.file.name for subj in subjects]} -> {out_file.name}')
@@ -165,6 +195,7 @@ def generate():
         start_idx += group.count
 
     logger.info('>>>> done generating')
+    return image_map
 
 
 if __name__ == '__main__':
