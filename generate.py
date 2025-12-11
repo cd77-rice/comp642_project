@@ -1,25 +1,19 @@
 from PIL import Image
 from PIL import ImageFile
-import logging
-import sys
+from PIL.PngImagePlugin import PngInfo
 import random
 import pathlib
+import shutil
 import numpy as np
 
+from config import logger
+from config import Process
 from config import OUTPUT_DIR, SubjectGroup
 from config import Point
 from config import Backdrop
 from config import Overlay
 from config import Subject
 from config import Inventory
-
-
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
-stdout_stream_handler = logging.StreamHandler(sys.stdout)
-stdout_stream_handler.setFormatter(logging.Formatter(
-    '%(asctime)s - %(levelname)s - %(message)s'))
-logger.addHandler(stdout_stream_handler)
 
 
 def random_point(overlay: Overlay, background: bool = False) -> tuple[Point, float]:
@@ -70,6 +64,7 @@ def overlay_images(backdrop: ImageFile.ImageFile,
     overlay_img_mod = overlay_img_mod.rotate(-rotation_deg)
 
     base_copy_img = backdrop.copy()
+    base_copy_img.filename = backdrop.filename      # type: ignore
     pos_mod = (
         pos_low_left_center.x - int(overlay_new_size[0] / 2),
         backdrop.size[1] - pos_low_left_center.y - overlay_new_size[1]
@@ -98,31 +93,76 @@ def random_overlay(subject: Subject, backdrop_img: ImageFile.ImageFile,
                           factor_base * factor_position)
 
 
-def scale_image(img: Image, overlay: Overlay):
+def crop_and_scale_image(img: Image.Image, overlay: Overlay):
     """
-    Scale and crop the image and return new image.
+    Crop and scale the image and return new image.
 
-    - If image w > h: cut left and right band (centered)
-    - If image w < h | w == h: cut top and bottom band (centered)
+    - Frist crop to lower aligned, centered bound box of width and height 
+      equal to `overlay.output_image_crop_width`
+    - Then, if `overlay.output_image_width != overlay.output_image_crop_width`
+      resize image to width and height `overlay.output_image_width`
     """
-
     min_img_dim = min(img.size)
-    if min_img_dim != overlay.output_image_width:
-        scale_factor = overlay.output_image_width / min_img_dim
-        img_mod = img.resize(
-            size=(int(img.size[0] * scale_factor),
-                          int(img.size[1] * scale_factor)))
-    else:
-        img_mod = img.copy()
+    if min_img_dim < overlay.output_image_crop_width:
+        logger.error(f'unable to crop {img.filename}: min dimension {min_img_dim} '   # type: ignore
+                     f'< output image width {overlay.output_image_crop_width}')
 
-    if min_img_dim == img.size[1]:
-        dh = int((img_mod.size[0] - overlay.output_image_width) / 2)
-        img_mod = img_mod.crop(box=(dh, 0, dh + overlay.output_image_width, img_mod.size[1]))
-    else:
-        dv = int((img_mod.size[0] - overlay.output_image_width) / 2)
-        img_mod = img_mod.crop(box=(0, dv, img_mod.size[1], dv + overlay.output_image_width))
+    width, height = img.size
+    left = int(width - overlay.output_image_crop_width) / 2
+    upper = height - overlay.output_image_crop_width
+    right = left + overlay.output_image_crop_width
+    lower = height
+    img_mod = img.crop(box=(left, upper, right, lower))
+
+    if overlay.output_image_crop_width != overlay.output_image_width:
+        img_mod = img_mod.resize(
+            (overlay.output_image_width, overlay.output_image_width))
 
     return img_mod
+
+
+def _make_image(idx: int, start_idx: int, zfill_width: int,
+                overlay: Overlay, group: SubjectGroup, 
+                backdrop_image: ImageFile.ImageFile, 
+                backdrop_dpm: float, 
+                subjects_by_type: dict[str, list[Subject]],
+                image_map: dict[SubjectGroup, list[pathlib.Path]],
+                subdir_name: str | None = None):
+    """
+    Creates the image and writes to file.
+
+    :param subdir_name: if specified will not use `group.subject_type` for the sub-directory name
+    """
+
+    image_number = f'{idx + 1 + start_idx}'.zfill(zfill_width)
+    if subdir_name is not None and subdir_name != '':
+        out_file = OUTPUT_DIR / subdir_name / f'{image_number}-{group.subject_type}.png'
+    else:
+        out_file = OUTPUT_DIR / group.subject_type / f'{image_number}-{group.subject_type}.png'
+
+    image_map[group].append(out_file)
+
+    subject_count = 1
+    if group.subject_type == "human" and random.random() < 0.15:
+        # background subject
+        subject_count = 2
+    subjects = random.sample(subjects_by_type[group.subject_type],
+                             k=subject_count)
+    overlayed_img = backdrop_image
+    if subject_count == 2:
+        overlayed_img = random_overlay(subjects[1], overlayed_img,
+                                       backdrop_dpm, overlay, True)
+    overlayed_img = random_overlay(subjects[0], overlayed_img,
+                                   backdrop_dpm, overlay)
+
+    overlayed_img = crop_and_scale_image(overlayed_img, overlay)
+    png_info = PngInfo()
+    png_info.add_text('subject', group.subject_type)
+
+    overlayed_img.save(out_file, pnginfo=png_info)
+    if Process.verbose:
+        logger.info(
+            f'{[subj.file.name for subj in subjects]} -> {out_file.name}')
 
 
 def generate() -> dict[SubjectGroup, list[pathlib.Path]]:
@@ -136,8 +176,10 @@ def generate() -> dict[SubjectGroup, list[pathlib.Path]]:
         OUTPUT_DIR.mkdir()
     else:
         for file in OUTPUT_DIR.iterdir():
-            if file.is_file():
+            if file.is_file() and not file.is_dir():
                 file.unlink()
+            if file.is_dir():
+                shutil.rmtree(file)
 
     logger.info('>>>> grouping images by subject type')
     subjects_by_type: dict[str, list[Subject]] = {}
@@ -158,6 +200,12 @@ def generate() -> dict[SubjectGroup, list[pathlib.Path]]:
     start_idx = 0
     overlay = Overlay()
     image_map: dict[SubjectGroup, list[pathlib.Path]] = {}
+
+    for class_name in [g.subject_type for g in overlay.groups] + ['real']:
+        class_path = OUTPUT_DIR / class_name
+        if not class_path.exists():
+            class_path.mkdir(exist_ok=False)
+
     for group in overlay.groups:
         image_map[group] = []
 
@@ -169,30 +217,41 @@ def generate() -> dict[SubjectGroup, list[pathlib.Path]]:
             logger.info(f'{group.count} images of "{group.subject_type}"')
 
         for idx in range(group.count):
-            image_number = f'{idx + 1 + start_idx}'.zfill(zfill_width)
-            out_file = OUTPUT_DIR / f'{image_number}-{group.subject_type}.png'
-            image_map[group].append(out_file)
-
-            subject_count = 1
-            if group.subject_type == "human" and random.random() < 0.15:
-                # background subject
-                subject_count = 2
-            subjects = random.sample(subjects_by_type[group.subject_type],
-                                     k=subject_count)
-            overlayed_img = backdrop_image
-            if subject_count == 2:
-                overlayed_img = random_overlay(subjects[1], overlayed_img,
-                                               backdrop_dpm, overlay, True)
-            overlayed_img = random_overlay(subjects[0], overlayed_img,
-                                           backdrop_dpm, overlay)
-
-            overlayed_img = scale_image(overlayed_img, overlay)
-
-            overlayed_img.save(out_file)
-            logger.info(
-                f'{[subj.file.name for subj in subjects]} -> {out_file.name}')
+            _make_image(idx, start_idx, zfill_width,
+                        overlay,
+                        group,
+                        backdrop_image,
+                        backdrop_dpm,
+                        subjects_by_type,
+                        image_map)
 
         start_idx += group.count
+
+    # real images
+    if overlay.real_images > 0:
+        start_idx = 0
+        for idx, group in enumerate(overlay.groups):
+            count = int(group.count/total_images * overlay.real_images)
+            if idx == len(overlay.groups) - 1:
+                # to ensure total number of real images is as specified
+                # take the remainder if this is the last iteration
+                # this is required because of flooring counts from floating point
+                count = overlay.real_images - start_idx
+            if count < 1:
+                logger.error(f'invalid count {count} for real images {overlay.real_images} '
+                             f'of "{group.subject_type}"')
+            for img_idx in range(count):
+                _make_image(img_idx, start_idx, zfill_width,
+                            overlay,
+                            group,
+                            backdrop_image,
+                            backdrop_dpm,
+                            subjects_by_type,
+                            image_map,
+                            subdir_name='real')
+
+            start_idx += count
+        logger.info(f'{start_idx} real images of {[g.subject_type for g in overlay.groups]}')
 
     logger.info('>>>> done generating')
     return image_map
